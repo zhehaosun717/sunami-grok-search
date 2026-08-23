@@ -62,7 +62,8 @@ chatter that no web index carries yet. It is now a real tool with real filters,
 exposed as `web_search` parameters:
 
 - `x_handles` / `exclude_x_handles` — comma-separated, max 20 each, `@` optional
-- `from_date` / `to_date` — ISO8601, applied to both web and X search
+- `from_date` / `to_date` — ISO8601. A hard bound on X, only a recency
+  preference on web (measured — see below)
 - `allowed_domains` / `excluded_domains` — web search only
 
 Setting `x_handles` narrows the request to X only. Leaving the web tool on
@@ -158,14 +159,53 @@ design end to end:
   with live URLs including a `discussions.unity.com` thread reporting Unity 6
   physics being slower than 2022.3 LTS.
 
-### Known unknown: date filtering
+### Date filtering on X: measured, strictly enforced
 
-`from_date` does not appear to be strictly honoured. A call with
-`from_date="2026-07-23"` still cited an October 2024 review and the original
-Unity 6 announcement. This may be the filter applying to retrieval while the
-model still cites indexed background, or the field may not affect
-`web_search` at all. Not resolved — it needs a dedicated controlled experiment.
-Do not rely on `from_date` as a hard recency guarantee.
+An early run suggested `from_date` was being ignored — a call with
+`from_date="2026-07-23"` cited an October 2024 review. A controlled experiment
+shows that was the web tool, not X.
+
+X status IDs are snowflakes: `timestamp_ms = (id >> 22) + 1288834974657`. That
+makes every returned post objectively datable straight from its URL, with no
+reliance on what the model claims. Three cells, same query, same
+`allowed_x_handles=["unity"]`, `x_search` only, varying just the dates:
+
+| cell | params | returned range | out of range |
+|---|---|---|---|
+| A | none | 2026-07-21 .. 2026-08-19 | — |
+| B | `from_date=2026-08-01` | 2026-08-13 .. 2026-08-21 | 0 / 6 |
+| C | `from_date=2024-01-01`, `to_date=2024-12-31` | 2024-01-31 .. 2024-07-22 | 0 / 3 |
+
+Cell C is the informative one: it surfaced posts from January, May and July
+2024 — content that never appears in the unfiltered baseline. The dates steer
+retrieval rather than post-filtering a recent result set, so they are usable as
+a real recency guarantee on X.
+
+Reproduce with `scripts/exp_dates.py`.
+
+### Date filtering on the web: a hint, not a bound
+
+The web tool behaves differently, and the difference matters when you rely on
+recency. Same query, `web_search` only, with and without `from_date`:
+
+| cell | params | sources | overlap with baseline |
+|---|---|---|---|
+| W1 | none | 6 | — |
+| W2 | `from_date=2026-08-01` | 8 | 3 |
+
+`from_date` clearly *influences* web retrieval — only half the baseline URLs
+survived and the rest of the set changed. But it does not bound it: W2 cited
+`unity.com/blog/unity-6-features-announcement`, the Unity 6 launch announcement,
+whose content predates the cutoff by well over a year.
+
+Treat it as a recency preference on web and a hard constraint on X.
+
+One caveat on the strength of this claim: a single counterexample disproves
+strict enforcement, but "content date" is not the same as "crawl or last-updated
+date", and a vendor blog post can be edited long after publication. The
+direction of the finding is solid; the mechanism behind it is not established.
+
+Reproduce with `scripts/exp_web_dates.py`.
 
 ## Not changed
 

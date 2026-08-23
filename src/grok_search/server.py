@@ -12,19 +12,22 @@ from pydantic import Field
 
 # 尝试使用绝对导入（支持 mcp run）
 try:
-    from grok_search.providers.grok import GrokSearchProvider
+    from grok_search.providers.grok import GrokSearchProvider, is_endpoint_unsupported
     from grok_search.logger import log_info
     from grok_search.config import config
-    from grok_search.sources import SourcesCache, merge_sources, new_session_id, split_answer_and_sources
+    from grok_search.sources import (SourcesCache, merge_sources, new_session_id,
+                                 split_answer_and_sources, sources_from_responses_payload)
     from grok_search.planning import engine as planning_engine, _split_csv
 except ImportError:
-    from .providers.grok import GrokSearchProvider
+    from .providers.grok import GrokSearchProvider, is_endpoint_unsupported
     from .logger import log_info
     from .config import config
-    from .sources import SourcesCache, merge_sources, new_session_id, split_answer_and_sources
+    from .sources import (SourcesCache, merge_sources, new_session_id,
+                      split_answer_and_sources, sources_from_responses_payload)
     from .planning import engine as planning_engine, _split_csv
 
 import asyncio
+import re
 
 mcp = FastMCP("grok-search")
 
@@ -71,6 +74,18 @@ async def _get_available_models_cached(api_url: str, api_key: str) -> list[str]:
     return models
 
 
+_X_PLATFORM_TOKENS = {"x", "twitter", "tweet", "tweets"}
+
+
+def _mentions_x(platform: str) -> bool:
+    """platform 字段是否点名了 X/Twitter。
+
+    按词切分再比对，避免 'x' 作为子串命中 'example' 这类无关平台名。
+    """
+    tokens = re.split(r"[^a-z0-9]+", (platform or "").lower())
+    return any(t in _X_PLATFORM_TOKENS for t in tokens if t)
+
+
 def _extra_results_to_sources(
     tavily_results: list[dict] | None,
     firecrawl_results: list[dict] | None,
@@ -115,13 +130,23 @@ def _extra_results_to_sources(
     name="web_search",
     output_schema=None,
     description="""
-    Before using this tool, please use the plan_intent tool to plan the search carefully.
-    Performs a deep web search based on the given query and returns Grok's answer directly.
+    Deep web + X (Twitter) search. Grok runs the retrieval; you read the sources.
 
-    This tool extracts sources if provided by upstream, caches them, and returns:
-    - session_id: string (When you feel confused or curious about the main content, use this field to invoke the get_sources tool to obtain the corresponding list of information sources)
+    In native mode this calls xAI's Responses API with the real web_search and
+    x_search tools, so citations come back as structured API data rather than
+    text the model wrote. X search is the reason to reach for this tool: live
+    community reaction, developer chatter, and breaking discussion that does not
+    exist in a search index yet.
+
+    Use x_handles to pin the search to specific accounts, and from_date/to_date
+    to bound it in time (both ISO8601, e.g. 2026-08-01).
+
+    Returns:
+    - session_id: string (pass to get_sources for the full source list)
     - content: string (answer only)
-    - sources_count: int
+    - sources_count: int (0 means retrieval genuinely returned nothing -- treat
+      any factual claim in content as unverified)
+    - search_mode: "native" | "legacy" (which path actually served the request)
     """,
     meta={"version": "2.0.0", "author": "guda.studio"},
 )
@@ -130,6 +155,13 @@ async def web_search(
     platform: Annotated[str, "Target platform to focus on (e.g., 'Twitter', 'GitHub', 'Reddit'). Leave empty for general web search."] = "",
     model: Annotated[str, "Optional model ID for this request only. This value is used ONLY when user explicitly provided."] = "",
     extra_sources: Annotated[int, "Number of additional reference results from Tavily/Firecrawl. Set 0 to disable. Default 0."] = 0,
+    x_handles: Annotated[str, "Comma-separated X handles to restrict the X search to (max 20), e.g. 'unity,unity3d'. Leading @ optional."] = "",
+    exclude_x_handles: Annotated[str, "Comma-separated X handles to exclude from the X search (max 20)."] = "",
+    from_date: Annotated[str, "Earliest date to consider, ISO8601 (e.g. 2026-08-01). Applies to both web and X search."] = "",
+    to_date: Annotated[str, "Latest date to consider, ISO8601 (e.g. 2026-08-23)."] = "",
+    allowed_domains: Annotated[str, "Comma-separated domains to restrict web search to, e.g. 'docs.unity3d.com'."] = "",
+    excluded_domains: Annotated[str, "Comma-separated domains to exclude from web search."] = "",
+    mode: Annotated[str, "Override search mode for this call: 'native' (Responses API tools), 'legacy' (prompt-only chat/completions), or 'auto'. Empty uses GROK_SEARCH_MODE."] = "",
 ) -> dict:
     session_id = new_session_id()
     try:
@@ -163,12 +195,64 @@ async def web_search(
         elif has_tavily:
             tavily_count = extra_sources
 
+    effective_mode = (mode or config.search_mode).strip().lower()
+    if effective_mode not in ("native", "legacy", "auto"):
+        effective_mode = "auto"
+
+    use_x = config.x_search_enabled
+    use_web = config.web_search_enabled
+    # platform 里点名 X/Twitter 时，强制打开 X 检索
+    if platform and _mentions_x(platform):
+        use_x = True
+
+    # 指定了 X handle 就说明调用方要的是这几个账号的发言。此时若仍开着
+    # 无过滤的全网搜索，web 结果会淹没 X 结果 —— 实测 x_handles="unity"
+    # 配一个含糊查询，8 条信源里 6 条是 Instagram / 飞机发动机新闻之类的噪音。
+    # 调用方显式给了域名过滤时视为确实想要 web，不做收窄。
+    if (x_handles or exclude_x_handles) and not (allowed_domains or excluded_domains):
+        use_web = False
+        use_x = True
+
+    if not use_x and not use_web:
+        use_web = True
+
     # 并行执行搜索任务
-    async def _safe_grok() -> str:
+    async def _safe_grok() -> tuple[str, list[dict], str]:
+        """返回 (正文, 结构化信源, 实际生效的模式)。"""
+        if effective_mode in ("native", "auto"):
+            try:
+                payload = await grok_provider.search_native(
+                    query,
+                    platform,
+                    use_web=use_web,
+                    use_x=use_x,
+                    allowed_x_handles=_split_csv(x_handles),
+                    excluded_x_handles=_split_csv(exclude_x_handles),
+                    from_date=from_date,
+                    to_date=to_date,
+                    allowed_domains=_split_csv(allowed_domains),
+                    excluded_domains=_split_csv(excluded_domains),
+                )
+                text, native_sources = sources_from_responses_payload(payload)
+                # 正文里若还留有链接，一并收进来；结构化信源优先，按 URL 去重
+                _, inline = split_answer_and_sources(text)
+                return text, merge_sources(native_sources, inline), "native"
+            except Exception as exc:
+                if effective_mode == "native":
+                    return f"native 检索失败: {exc}", [], "native"
+                await log_info(
+                    None,
+                    "native 检索失败，回退 legacy（endpoint_unsupported=%s）: %s"
+                    % (is_endpoint_unsupported(exc), exc),
+                    True,
+                )
+
         try:
-            return await grok_provider.search(query, platform)
+            raw = await grok_provider.search(query, platform)
         except Exception:
-            return ""
+            raw = ""
+        answer, inline = split_answer_and_sources(raw)
+        return answer, inline, "legacy"
 
     async def _safe_tavily() -> list[dict] | None:
         try:
@@ -192,7 +276,7 @@ async def web_search(
 
     gathered = await asyncio.gather(*coros)
 
-    grok_result: str = gathered[0] or ""
+    grok_answer, grok_sources, used_mode = gathered[0]
     tavily_results: list[dict] | None = None
     firecrawl_results: list[dict] | None = None
     idx = 1
@@ -202,12 +286,16 @@ async def web_search(
     if firecrawl_count > 0:
         firecrawl_results = gathered[idx]
 
-    answer, grok_sources = split_answer_and_sources(grok_result)
     extra = _extra_results_to_sources(tavily_results, firecrawl_results)
     all_sources = merge_sources(grok_sources, extra)
 
     await _SOURCES_CACHE.set(session_id, all_sources)
-    return {"session_id": session_id, "content": answer, "sources_count": len(all_sources)}
+    return {
+        "session_id": session_id,
+        "content": grok_answer,
+        "sources_count": len(all_sources),
+        "search_mode": used_mode,
+    }
 
 
 @mcp.tool(

@@ -8,9 +8,11 @@ class Config:
         'claude mcp add-json grok-search --scope user '
         '\'{"type":"stdio","command":"uvx","args":["--from",'
         '"git+https://github.com/GuDaStudio/GrokSearch","grok-search"],'
-        '"env":{"GUDA_API_KEY":"your-guda-api-key"}}\''
+        '"env":{"GROK_API_URL":"https://api.x.ai/v1","GROK_API_KEY":"your-xai-api-key","TAVILY_API_KEY":"tvly-your-tavily-key"}}\''
     )
-    _DEFAULT_MODEL = "grok-4.20-beta"
+    # grok-4.6 是 xAI 文档中明确支持 x_search / web_search 工具的模型。
+    # 上游默认的 grok-4.20-beta 不在 /models 列表内，靠别名解析，随时可能失效。
+    _DEFAULT_MODEL = "grok-4.6"
     _DEFAULT_GUDA_BASE_URL = "https://code.guda.studio"
 
     def __new__(cls):
@@ -63,6 +65,25 @@ class Config:
     @property
     def retry_max_wait(self) -> int:
         return int(os.getenv("GROK_RETRY_MAX_WAIT", "10"))
+
+    @property
+    def search_mode(self) -> str:
+        """检索模式：native / legacy / auto（默认）。
+
+        native  —— 只走 /v1/responses + 原生 web_search/x_search 工具。
+        legacy  —— 只走上游原有的 /chat/completions 提示词模式（需上游网关自带检索）。
+        auto    —— 先试 native，端点不支持时回退 legacy。
+        """
+        mode = os.getenv("GROK_SEARCH_MODE", "auto").strip().lower()
+        return mode if mode in ("native", "legacy", "auto") else "auto"
+
+    @property
+    def x_search_enabled(self) -> bool:
+        return os.getenv("GROK_X_SEARCH", "true").lower() in ("true", "1", "yes")
+
+    @property
+    def web_search_enabled(self) -> bool:
+        return os.getenv("GROK_WEB_SEARCH", "true").lower() in ("true", "1", "yes")
 
     @property
     def guda_base_url(self) -> str:
@@ -202,6 +223,9 @@ class Config:
             "GROK_API_URL": api_url,
             "GROK_API_KEY": api_key_masked,
             "GROK_MODEL": self.grok_model,
+            "GROK_SEARCH_MODE": self.search_mode,
+            "GROK_X_SEARCH": self.x_search_enabled,
+            "GROK_WEB_SEARCH": self.web_search_enabled,
             "GROK_DEBUG": self.debug_enabled,
             "GROK_LOG_LEVEL": self.log_level,
             "GROK_LOG_DIR": str(self.log_dir),

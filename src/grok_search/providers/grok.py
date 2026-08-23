@@ -7,7 +7,7 @@ from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait
 from tenacity.wait import wait_base
 from zoneinfo import ZoneInfo
 from .base import BaseSearchProvider, SearchResult
-from ..utils import search_prompt, fetch_prompt, url_describe_prompt, rank_sources_prompt
+from ..utils import search_prompt, fetch_prompt, url_describe_prompt, rank_sources_prompt, native_search_prompt
 from ..logger import log_info
 from ..config import config
 
@@ -286,3 +286,152 @@ class GrokSearchProvider(BaseSearchProvider):
             if i not in seen:
                 order.append(i)
         return order
+
+    # -----------------------------------------------------------------------
+    # sunami: 原生工具检索（xAI Responses API）
+    #
+    # 上游的 search() 走 /chat/completions，payload 里没有任何工具声明，
+    # 检索完全依赖上游端点在服务端代劳。直连 api.x.ai 时那条路等于让模型
+    # 凭记忆作答。下面这条走 /v1/responses + tools，检索由 xAI 真实执行，
+    # 引用以 annotations(url_citation) 结构化返回。
+    # -----------------------------------------------------------------------
+
+    def _build_search_tools(
+        self,
+        use_web: bool = True,
+        use_x: bool = True,
+        allowed_x_handles: Optional[List[str]] = None,
+        excluded_x_handles: Optional[List[str]] = None,
+        from_date: str = "",
+        to_date: str = "",
+        allowed_domains: Optional[List[str]] = None,
+        excluded_domains: Optional[List[str]] = None,
+    ) -> List[dict]:
+        """构造 Responses API 的 tools 数组。只写入实际设置了的过滤字段。"""
+        tools: List[dict] = []
+
+        if use_x:
+            x_tool: dict = {"type": "x_search"}
+            # xAI 文档限制 allowed/excluded handles 各最多 20 个
+            if allowed_x_handles:
+                x_tool["allowed_x_handles"] = [h.lstrip("@") for h in allowed_x_handles[:MAX_X_HANDLES]]
+            if excluded_x_handles:
+                x_tool["excluded_x_handles"] = [h.lstrip("@") for h in excluded_x_handles[:MAX_X_HANDLES]]
+            if from_date:
+                x_tool["from_date"] = from_date
+            if to_date:
+                x_tool["to_date"] = to_date
+            tools.append(x_tool)
+
+        if use_web:
+            web_tool: dict = {"type": "web_search"}
+            if allowed_domains:
+                web_tool["allowed_domains"] = allowed_domains
+            if excluded_domains:
+                web_tool["excluded_domains"] = excluded_domains
+            if from_date:
+                web_tool["from_date"] = from_date
+            if to_date:
+                web_tool["to_date"] = to_date
+            tools.append(web_tool)
+
+        return tools
+
+    async def search_native(
+        self,
+        query: str,
+        platform: str = "",
+        use_web: bool = True,
+        use_x: bool = True,
+        allowed_x_handles: Optional[List[str]] = None,
+        excluded_x_handles: Optional[List[str]] = None,
+        from_date: str = "",
+        to_date: str = "",
+        allowed_domains: Optional[List[str]] = None,
+        excluded_domains: Optional[List[str]] = None,
+        ctx=None,
+    ) -> dict:
+        """走 /v1/responses + 原生检索工具，返回原始响应体。
+
+        解析交给 sources.sources_from_responses_payload —— provider 只负责传输，
+        避免 providers 反向依赖 sources 造成循环导入。
+        """
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        tools = self._build_search_tools(
+            use_web=use_web,
+            use_x=use_x,
+            allowed_x_handles=allowed_x_handles,
+            excluded_x_handles=excluded_x_handles,
+            from_date=from_date,
+            to_date=to_date,
+            allowed_domains=allowed_domains,
+            excluded_domains=excluded_domains,
+        )
+        if not tools:
+            raise ValueError("search_native 至少需要启用 web_search 或 x_search 之一")
+
+        user_content = query
+        if _needs_time_context(query):
+            user_content = get_local_time_info() + "\n" + user_content
+        if platform:
+            user_content += (
+                "\n\nFocus your searches on these platforms: " + platform + "\n"
+            )
+
+        payload = {
+            "model": self.model,
+            "instructions": native_search_prompt,
+            "input": [{"role": "user", "content": user_content}],
+            "tools": tools,
+        }
+
+        await log_info(
+            ctx,
+            f"search_native tools={[t['type'] for t in tools]} model={self.model}",
+            config.debug_enabled,
+        )
+
+        return await self._execute_json_with_retry(headers, payload, "/responses", ctx)
+
+    async def _execute_json_with_retry(
+        self, headers: dict, payload: dict, path: str, ctx=None
+    ) -> dict:
+        """非流式 JSON 请求，复用与流式路径相同的重试策略。
+
+        带工具的检索耗时明显长于纯生成，read 超时放宽到 180s。
+        """
+        timeout = httpx.Timeout(connect=6.0, read=180.0, write=10.0, pool=None)
+
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(config.retry_max_attempts + 1),
+                wait=_WaitWithRetryAfter(config.retry_multiplier, config.retry_max_wait),
+                retry=retry_if_exception(_is_retryable_exception),
+                reraise=True,
+            ):
+                with attempt:
+                    response = await client.post(
+                        f"{self.api_url}{path}",
+                        headers=headers,
+                        json=payload,
+                    )
+                    response.raise_for_status()
+                    return response.json()
+
+
+MAX_X_HANDLES = 20
+
+
+def is_endpoint_unsupported(exc) -> bool:
+    """判断异常是否表示端点/工具不被支持，用于回退到 chat/completions。
+
+    网关实现不一：不支持 Responses API 时可能返回 404，也可能返回 400/422
+    （能路由但拒绝 tools 字段）。这几种都视为"该端点走不通"，而非临时故障。
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in (400, 404, 405, 422, 501)
+    return False

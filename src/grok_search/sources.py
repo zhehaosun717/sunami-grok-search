@@ -335,3 +335,78 @@ def _extract_sources_from_text(text: str) -> list[dict]:
         sources.append({"url": url})
 
     return sources
+
+
+# ---------------------------------------------------------------------------
+# sunami: xAI Responses API 结构化信源提取
+#
+# 上游只有 split_answer_and_sources 一条路径 —— 从模型正文里用正则刮 URL。
+# 那套启发式在上游网关（会把真实链接写进正文）下能用，在裸 api.x.ai 下
+# 只会刮到模型编造的 citation_card{source="..."}（无 URL，因此 0 信源）。
+#
+# 走 /v1/responses + web_search/x_search 工具时，引用由 API 以
+# annotations[].url_citation 结构化返回，不依赖模型的正文措辞。
+# ---------------------------------------------------------------------------
+
+def _push_source(url: Any, title: Any, seen: set[str], out: list[dict]) -> None:
+    if not isinstance(url, str):
+        return
+    url = url.strip()
+    if not url.startswith(("http://", "https://")) or url in seen:
+        return
+    seen.add(url)
+    item: dict = {"url": url, "provider": "xai"}
+    if isinstance(title, str) and title.strip():
+        item["title"] = title.strip()
+    out.append(item)
+
+
+def sources_from_responses_payload(data: Any) -> tuple[str, list[dict]]:
+    """从 xAI Responses API 返回体中提取正文与 url_citation 信源。
+
+    返回 (text, sources)。text 为拼接后的 output_text，sources 为按首次
+    出现顺序去重的信源列表。任何结构异常都降级为空结果，由调用方决定回退。
+    """
+    if not isinstance(data, dict):
+        return "", []
+
+    text_parts: list[str] = []
+    sources: list[dict] = []
+    seen: set[str] = set()
+
+    for item in data.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        for block in item.get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "output_text":
+                text = block.get("text")
+                if isinstance(text, str) and text:
+                    text_parts.append(text)
+            for ann in block.get("annotations") or []:
+                if not isinstance(ann, dict):
+                    continue
+                if ann.get("type") != "url_citation":
+                    continue
+                _push_source(ann.get("url"), ann.get("title"), seen, sources)
+
+    # 部分实现会在顶层给出便捷字段，作为兜底
+    if not text_parts:
+        fallback_text = data.get("output_text")
+        if isinstance(fallback_text, str) and fallback_text:
+            text_parts.append(fallback_text)
+
+    # 少数网关会平铺一个 citations 数组，一并吸收
+    for citation in data.get("citations") or []:
+        if isinstance(citation, str):
+            _push_source(citation, None, seen, sources)
+        elif isinstance(citation, dict):
+            _push_source(
+                citation.get("url"),
+                citation.get("title") or citation.get("label"),
+                seen,
+                sources,
+            )
+
+    return "\n".join(text_parts).strip(), sources

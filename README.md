@@ -16,7 +16,7 @@
 > 只会让模型编造 `citation_card` 引用、`sources_count` 恒为 0。
 > 本 fork 改走 xAI Responses API 的原生 `web_search` / `x_search` 工具，
 > 引用从 `annotations[].url_citation` 结构化读取，并把 X 检索的账号/时间过滤开放为参数。
-> 改动详情见 **[SUNAMI.md](./SUNAMI.md)**。下方为上游原始文档。
+> 改动详情见 **[SUNAMI.md](./SUNAMI.md)**；换机器部署把 **[PROMPT.md](./PROMPT.md)** 里的提示词丢给 agent 即可。下方为上游原始文档。
 
 
 ---

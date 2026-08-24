@@ -70,6 +70,60 @@ fork 地址：https://github.com/zhehaosun717/sunami-grok-search
 install」那一节的表格。按那个格式写进对应文件，写完让我确认，然后我重启客户端。
 ```
 
+## 给不认识的 harness/agent 新装（配置格式未知）
+
+上面的模板假设你知道自己用的是哪种客户端、配置长什么样。如果是自建或不常见的
+harness（比如某个本地跑的 DeepSeek/Qwen agent 框架），配置文件位置和格式可能
+和标准客户端都不一样，你也未必记得。这种情况让跑在那个 harness 里的 agent
+自己去找，比你或我瞎猜更可靠 —— 它对自己的运行环境最清楚。
+
+把这段发给那个 harness 里的 agent，**先把两个 key 填进去**：
+
+```
+帮我给你自己（当前这个 agent/harness）装一个 MCP server，叫 grok-search。
+
+我不知道你的 MCP 配置文件在哪、长什么格式，所以先别动手写，按下面的顺序来：
+
+1. 找到你自己的 MCP 配置在哪个文件、什么格式（JSON/TOML/YAML/其他），
+   如果你不确定，检查你的启动参数、文档、或已经配置好的其他 MCP server
+   （如果有的话）作为格式参考。把你找到的文件路径和现有内容（脱敏掉任何
+   key/token）贴给我看，先别写。
+
+2. 我确认格式之后，你再照这个内容加一个 server 条目：
+   name:    grok-search
+   command: uvx
+   args:    --python 3.12 --from git+https://github.com/zhehaosun717/sunami-grok-search grok-search
+   env:
+     GROK_API_URL   = https://api.x.ai/v1
+     GROK_API_KEY   = <填你的 xAI key>
+     TAVILY_API_URL = https://api.tavily.com
+     TAVILY_API_KEY = <填你的 Tavily key>
+
+3. 写之前把原文件备份一份（加时间戳后缀），只在配置文件里新增这一个 server
+   条目，不要动其他已有的 server 或字段。
+
+4. 写完把 diff 或改动前后对比给我看，然后告诉我要怎么重启/重新加载你才能
+   生效（重启进程？重新加载配置？发某个内部命令？你自己知道该怎么做）。
+
+常见格式供你参考（不一定和你的一致，只是给你个方向）：
+  - JSON 风格（Claude Desktop / Antigravity 常见）：
+    { "mcpServers": { "grok-search": { "command": "uvx", "args": [...], "env": {...} } } }
+  - TOML 风格（Codex 常见）：
+    [mcp_servers.grok-search]
+    command = "uvx"
+    args = [...]
+    [mcp_servers.grok-search.env]
+    GROK_API_KEY = "..."
+  - command 数组风格（opencode 常见）：
+    { "mcp": { "grok-search": { "type": "local", "command": ["uvx", "--from", "..."], "environment": {...} } } }
+
+约束：
+- 不要把 key 打印在你给我看的确认信息里之外的任何地方（日志、其他文件）。
+- 不确定的地方就停下来问，不要猜一个格式就直接写。
+```
+
+装完用下面「验证装对了没有」那一节确认。
+
 ## 验证装对了没有
 
 重启客户端后，问它：

@@ -132,6 +132,39 @@ claude mcp add-json grok-search --scope user '{
 }'
 ```
 
+## Migrating an existing install
+
+If a machine already runs the upstream server, the config lives in a different
+file and a different shape for every client. `scripts/migrate_clients.py` finds
+them and repoints the `--from` URL:
+
+```bash
+python scripts/migrate_clients.py          # dry run, reports only
+python scripts/migrate_clients.py --apply  # writes, backing up first
+```
+
+It rewrites only the URL substring, so JSONC comments, TOML layout, and each
+client's own fields (`enabled`, `disabled`, `type`, ...) survive untouched. API
+keys are never read or modified. Every edited file is backed up to
+`<name>.bak-<timestamp>`. Restart the client afterwards.
+
+Where each client keeps it, if you would rather edit by hand:
+
+| Client | File | Shape |
+|---|---|---|
+| Claude Desktop | `%APPDATA%/Claude/claude_desktop_config.json`<br>`~/Library/Application Support/Claude/…` | `mcpServers.<n>.args[]` |
+| Claude Code | `~/.claude.json` | `mcpServers.<n>.args[]` |
+| Codex | `~/.codex/config.toml` | `[mcp_servers.grok-search] args = [...]` |
+| opencode | `~/.config/opencode/opencode.json(c)` | `mcp.<n>.command[]` |
+| Antigravity | `~/.gemini/antigravity-ide/mcp_config.json` | `mcpServers.<n>.args[]` |
+
+Note that `claude mcp remove grok-search` only touches the Claude **Code** CLI
+config. An install made through the Claude **Desktop** app is invisible to it
+and has to be edited in the file above.
+
+Drop the `@grok-with-tavily` branch suffix when repointing — this fork's default
+branch is `main`.
+
 ## Tests
 
 ```bash

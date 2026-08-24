@@ -123,7 +123,7 @@ claude mcp remove grok-search
 claude mcp add-json grok-search --scope user '{
   "type": "stdio",
   "command": "uvx",
-  "args": ["--from", "git+https://github.com/<you>/sunami-grok-search", "grok-search"],
+  "args": ["--from", "git+https://github.com/zhehaosun717/sunami-grok-search", "grok-search"],
   "env": {
     "GROK_API_URL": "https://api.x.ai/v1",
     "GROK_API_KEY": "xai-...",

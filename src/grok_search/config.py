@@ -7,7 +7,7 @@ class Config:
     _SETUP_COMMAND = (
         'claude mcp add-json grok-search --scope user '
         '\'{"type":"stdio","command":"uvx","args":["--from",'
-        '"git+https://github.com/GuDaStudio/GrokSearch","grok-search"],'
+        '"git+https://github.com/zhehaosun717/sunami-grok-search","grok-search"],'
         '"env":{"GROK_API_URL":"https://api.x.ai/v1","GROK_API_KEY":"your-xai-api-key","TAVILY_API_KEY":"tvly-your-tavily-key"}}\''
     )
     # grok-4.6 是 xAI 文档中明确支持 x_search / web_search 工具的模型。

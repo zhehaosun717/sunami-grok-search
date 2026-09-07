@@ -240,10 +240,21 @@ async def web_search(
             except Exception as exc:
                 if effective_mode == "native":
                     return f"native 检索失败: {exc}", [], "native"
+                # auto 只在端点确实走不通（404/400/422 等）时才回退。超时、
+                # 限流、鉴权失败这类暂时性故障回退到 legacy 毫无意义：legacy
+                # 自身不检索，在 api.x.ai 上只能照记忆答题并编造引用 —— 正是
+                # 本 fork 要消灭的失败模式。宁可如实报错，也不要给出一份看起
+                # 来有据可查、实则凭空捏造的答案。
+                if not is_endpoint_unsupported(exc):
+                    await log_info(
+                        None,
+                        "native 检索失败且端点本身可用，不回退 legacy: %s" % exc,
+                        True,
+                    )
+                    return f"native 检索失败: {exc}", [], "native"
                 await log_info(
                     None,
-                    "native 检索失败，回退 legacy（endpoint_unsupported=%s）: %s"
-                    % (is_endpoint_unsupported(exc), exc),
+                    "端点不支持 Responses API，回退 legacy: %s" % exc,
                     True,
                 )
 

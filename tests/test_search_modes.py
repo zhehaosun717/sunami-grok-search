@@ -113,6 +113,35 @@ async def test_auto_falls_back_when_endpoint_unsupported(stub):
     assert "旧路径答案" in result["content"]
 
 
+async def test_auto_does_not_fall_back_on_transient_failure(stub):
+    """端点可用但这次请求挂了（500），auto 必须报错而不是降级。
+
+    回退的前提是"这个端点走不通"。限流、超时、5xx 都不是那回事 —— 端点
+    好好的，只是这一次没成。此时降级到 legacy 换来的不是"退而求其次的检
+    索结果"，而是一份凭记忆编造引用的答案，比直接失败更有害。
+    """
+    stub["set_native"](_http_error(500))
+    stub["set_legacy"](LEGACY_TEXT)
+
+    result = await server.web_search("unity 性能", mode="auto")
+
+    assert result["search_mode"] == "native"
+    assert result["sources_count"] == 0
+    assert "native 检索失败" in result["content"]
+    assert stub["legacy"] == 0, "暂时性故障不得回退 legacy"
+
+
+async def test_auto_does_not_fall_back_on_timeout(stub):
+    """超时同理：连接不上不等于端点不支持 Responses API。"""
+    stub["set_native"](httpx.ReadTimeout("timed out"))
+    stub["set_legacy"](LEGACY_TEXT)
+
+    result = await server.web_search("unity 性能", mode="auto")
+
+    assert result["search_mode"] == "native"
+    assert stub["legacy"] == 0
+
+
 async def test_native_mode_surfaces_error_instead_of_silent_fallback(stub):
     """显式指定 native 时失败要报出来，不能悄悄降级 —— 否则用户以为在用 X 检索。"""
     stub["set_native"](_http_error(404))
